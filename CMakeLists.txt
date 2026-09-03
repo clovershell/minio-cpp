@@ -102,6 +102,10 @@ list(APPEND MINIO_CPP_LIBS ${MINIO_CPP_DEPS_LINK_LIBS})
 if (WIN32)
   list(APPEND MINIO_CPP_LIBS wsock32)
   list(APPEND MINIO_CPP_LIBS ws2_32)
+  # miniocpp.pc.in has no visibility into target_link_libraries() - without this,
+  # pkg-config consumers (non-CMake) are missing wsock32/ws2_32 at link time
+  # (getaddrinfo, select, ...).
+  set(MINIO_CPP_PC_EXTRA_LIBS " -lwsock32 -lws2_32")
 endif()
 if (APPLE)
   # httplib loads macOS system certificates from the Keychain
@@ -179,6 +183,78 @@ target_include_directories(miniocpp PUBLIC
   $<BUILD_INTERFACE:${MINIO_CPP_INCLUDES}>
 )
 target_link_libraries(miniocpp PUBLIC ${MINIO_CPP_LIBS})
+
+# Optional C++20 module interface for the public API (modules/miniocpp.cc).
+# FILE_SET CXX_MODULES (CMake 3.28+) attaches it as a real part of the miniocpp
+# target's build - the compiler gets whatever flags it needs for a module
+# interface unit (e.g. /interface for MSVC) based on this declaration, not on
+# the file's extension, so any CMake/MSBuild/Meson (via cmake.subproject())
+# consumer of this target picks up `import miniocpp;` automatically. Requires
+# C++20 (MINIO_CPP_STD=20); silently skipped otherwise for older setups.
+#
+# CMake's module dependency scanning is only implemented for the Ninja,
+# Ninja Multi-Config, and Visual Studio (17.4+) generators - with any other
+# generator (e.g. the Linux/macOS default "Unix Makefiles") CMake hard-errors
+# at the Generate step as soon as it sees FILE_SET CXX_MODULES sources, even
+# if MINIO_CPP_STD=20 was requested intentionally. Generator *name* alone is
+# not enough either: CMake 3.28 requires Ninja 1.11+ for the dyndep-based
+# scanning, and each compiler has its own minimum version for module support
+# (MSVC 14.34 / VS 17.4, reported as compiler version 19.34; Clang 16;
+# GCC 14) - see https://cmake.org/cmake/help/v3.28/manual/cmake-cxxmodules.7.html.
+# An older or unrecognized compiler can still match the generator check
+# above and then break module dependency scanning instead of falling back
+# cleanly, so reject anything not explicitly known-good rather than
+# defaulting to allowed.
+set(MINIO_CPP_HAS_CXX_MODULE OFF)
+if (CMAKE_VERSION VERSION_GREATER_EQUAL "3.28" AND MINIO_CPP_STD STREQUAL "20")
+  set(MINIO_CPP_MODULE_TOOLCHAIN_OK OFF)
+  if (CMAKE_GENERATOR STREQUAL "Ninja" OR CMAKE_GENERATOR STREQUAL "Ninja Multi-Config")
+    execute_process(
+      COMMAND "${CMAKE_MAKE_PROGRAM}" --version
+      OUTPUT_VARIABLE MINIO_CPP_NINJA_VERSION
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+      ERROR_QUIET
+    )
+    if (MINIO_CPP_NINJA_VERSION VERSION_GREATER_EQUAL "1.11")
+      set(MINIO_CPP_MODULE_TOOLCHAIN_OK ON)
+    endif()
+  elseif (CMAKE_GENERATOR MATCHES "^Visual Studio ")
+    set(MINIO_CPP_MODULE_TOOLCHAIN_OK ON)
+  endif()
+
+  # Applies regardless of which of the generators above is in use - Ninja can
+  # also drive an MSVC/Clang/GCC toolchain, and each compiler's own module
+  # support is gated on its own version, not the generator. Reject any
+  # compiler not explicitly listed here, rather than silently allowing it.
+  if (MINIO_CPP_MODULE_TOOLCHAIN_OK)
+    if (CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+      if (CMAKE_CXX_COMPILER_VERSION VERSION_LESS "19.34")
+        set(MINIO_CPP_MODULE_TOOLCHAIN_OK OFF)
+      endif()
+    elseif (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+      if (CMAKE_CXX_COMPILER_VERSION VERSION_LESS "16.0")
+        set(MINIO_CPP_MODULE_TOOLCHAIN_OK OFF)
+      endif()
+    elseif (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+      if (CMAKE_CXX_COMPILER_VERSION VERSION_LESS "14")
+        set(MINIO_CPP_MODULE_TOOLCHAIN_OK OFF)
+      endif()
+    else()
+      set(MINIO_CPP_MODULE_TOOLCHAIN_OK OFF)
+    endif()
+  endif()
+
+  if (MINIO_CPP_MODULE_TOOLCHAIN_OK)
+    set(MINIO_CPP_HAS_CXX_MODULE ON)
+    target_sources(miniocpp
+      PUBLIC
+        FILE_SET CXX_MODULES
+        BASE_DIRS modules
+        FILES modules/miniocpp.cc
+    )
+  endif()
+endif()
+
 # httplib's class layout depends on CPPHTTPLIB_OPENSSL_SUPPORT; define it once
 # target-wide so every translation unit compiles httplib.h identically.
 target_compile_definitions(miniocpp PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
@@ -317,12 +393,22 @@ if (MINIO_CPP_ENABLE_RDMA)
                         INSTALL_RPATH "$ORIGIN")
 endif()
 
-install(TARGETS miniocpp
-        EXPORT miniocpp-targets
-        RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
-        ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
-        LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
-        INCLUDES DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}")
+if (MINIO_CPP_HAS_CXX_MODULE)
+  install(TARGETS miniocpp
+          EXPORT miniocpp-targets
+          RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
+          ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+          LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+          INCLUDES DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
+          FILE_SET CXX_MODULES DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/miniocpp/modules")
+else()
+  install(TARGETS miniocpp
+          EXPORT miniocpp-targets
+          RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
+          ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+          LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+          INCLUDES DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}")
+endif()
 
 # Source-built deps must be in an export set for install(EXPORT) to resolve
 # them (miniocpp_inih does not export itself).
@@ -333,6 +419,17 @@ if (MINIO_CPP_DEPS_EXPORT_TARGETS)
           LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
           ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}")
 endif()
+
+# Known limitation: this export does not pass CXX_MODULES_DIRECTORY, so an
+# installed package (via find_package(miniocpp) + CMake, as opposed to
+# consuming subprojects/miniocpp source directly, or via pkg-config/vcpkg)
+# is missing the generated module metadata CMake needs to let a downstream
+# CMake consumer `import miniocpp;` - see
+# https://cmake.org/cmake/help/latest/command/install.html#exporting-c-modules.
+# Separately, installing module interfaces is not supported at all with
+# the Visual Studio generator (independent of the MINIO_CPP_HAS_CXX_MODULE
+# toolchain gate above, which only covers the build step). Neither gap is
+# covered by an automated test yet.
 
 # The link interface is not exported; miniocpp-config.cmake re-applies it.
 install(EXPORT miniocpp-targets

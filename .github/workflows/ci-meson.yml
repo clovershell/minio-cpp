@@ -1,0 +1,127 @@
+name: MinIO C++ Meson
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-meson:
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+        - { name: "Ubuntu_Latest_GCC_Meson", os: ubuntu-latest, triplet: "x64-linux" }
+        - { name: "Ubuntu_Latest_GCC_arm64_Meson", os: ubuntu-24.04-arm, triplet: "arm64-linux" }
+        - { name: "Ubuntu_Latest_Clang_Meson", os: ubuntu-latest, triplet: "x64-linux" }
+        - { name: "macOS_Latest_Clang_Meson", os: macos-latest, triplet: "arm64-osx" }
+        - { name: "Windows_Latest_MSVC_Meson", os: windows-latest, triplet: "x64-windows" }
+
+    name: ${{ matrix.config.name }}
+    runs-on: ${{ matrix.config.os }}
+
+    steps:
+    - name: Checkout minio-cpp
+      uses: actions/checkout@v4
+      with:
+        path: minio-cpp
+
+    - name: Checkout vcpkg
+      uses: actions/checkout@v4
+      with:
+        repository: microsoft/vcpkg
+        ref: "2026.07.29"
+        path: vcpkg
+
+    - name: Install Meson and Ninja
+      if: startsWith(matrix.config.os, 'ubuntu')
+      run: pip install --user meson ninja
+
+    - name: Install Meson and Ninja if Windows
+      if: startsWith(matrix.config.os, 'windows')
+      run: pip install meson ninja
+
+      # arm64 Linux has no prebuilt vcpkg CMake, so vcpkg falls back to the system
+      # cmake; the apt version (3.28) is too old for vcpkg's SPDX generation
+      # (string(JSON ... STRING_ENCODE)). Provide a recent cmake on PATH.
+    - name: Install recent CMake
+      uses: lukka/get-cmake@fffaaafeea488556c2c12dad60690008bc1caacb # v4.4.2
+
+    - name: Install GCC 14 if Ubuntu
+      if: startsWith(matrix.config.name, 'Ubuntu_Latest_GCC')
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y gcc-14 g++-14
+        echo "CC=gcc-14" >> "$GITHUB_ENV"
+        echo "CXX=g++-14" >> "$GITHUB_ENV"
+
+    # clang-tools-18 надає clang-scan-deps - Meson шукає бінарник тієї ж
+    # версії, що й сам компілятор, щоб просканувати modules/miniocpp.cc на
+    # залежності для Ninja dyndep.
+    - name: Install Clang 18 if Ubuntu Clang
+      if: matrix.config.name == 'Ubuntu_Latest_Clang_Meson'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y clang-18 clang-tools-18
+        echo "CC=clang-18" >> "$GITHUB_ENV"
+        echo "CXX=clang++-18" >> "$GITHUB_ENV"
+
+    - name: Install dependencies if macOS
+      if: startsWith(matrix.config.os, 'macos')
+      run: brew install meson ninja pkg-config
+
+    - name: Set up MSVC dev environment if Windows
+      if: startsWith(matrix.config.os, 'windows')
+      uses: ilammy/msvc-dev-cmd@v1
+
+    - name: Remove Git's link.exe if Windows
+      if: startsWith(matrix.config.os, 'windows')
+      shell: bash
+      run: rm -f "/c/Program Files/Git/usr/bin/link.EXE"
+
+    - name: Bootstrap vcpkg
+      shell: bash
+      run: |
+        if [ "$RUNNER_OS" = "Windows" ]; then
+          ./vcpkg/bootstrap-vcpkg.bat -disableMetrics
+        else
+          ./vcpkg/bootstrap-vcpkg.sh -disableMetrics
+        fi
+
+    - name: Install dependencies via vcpkg
+      shell: bash
+      run: |
+        ./vcpkg/vcpkg install \
+          "cpp-httplib[core,openssl]:${{ matrix.config.triplet }}" \
+          "inih[core,cpp]:${{ matrix.config.triplet }}" \
+          "nlohmann-json:${{ matrix.config.triplet }}" \
+          "openssl:${{ matrix.config.triplet }}" \
+          "pugixml:${{ matrix.config.triplet }}" \
+          "zlib:${{ matrix.config.triplet }}"
+
+    - name: Configure and build (Meson)
+      if: ${{ !startsWith(matrix.config.os, 'windows') }}
+      shell: bash
+      run: |
+        cd minio-cpp
+        meson setup build \
+          -Dpkg_config_path="${{ github.workspace }}/vcpkg/installed/${{ matrix.config.triplet }}/lib/pkgconfig" \
+          -Dcmake_prefix_path="${{ github.workspace }}/vcpkg/installed/${{ matrix.config.triplet }}"
+        meson compile -C build
+
+    - name: Configure and build (Meson) if Windows
+      if: startsWith(matrix.config.os, 'windows')
+      shell: cmd
+      run: |
+        cd minio-cpp
+        meson setup build -Dpkg_config_path="${{ github.workspace }}/vcpkg/installed/${{ matrix.config.triplet }}/lib/pkgconfig" -Dcmake_prefix_path="${{ github.workspace }}/vcpkg/installed/${{ matrix.config.triplet }}"
+        meson compile -C build
